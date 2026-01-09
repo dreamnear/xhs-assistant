@@ -1,0 +1,685 @@
+"""
+粉丝数据抓取模块
+从小红书创作者平台抓取粉丝数据（每日新增、掉丝、总数）
+"""
+import asyncio
+import json
+from typing import Optional, Callable, List, Dict, Any
+from datetime import datetime, timedelta
+from playwright.async_api import Page, Response
+
+from config import Config
+from core.browser import browser_manager
+from core.exporter import ExcelExporter
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class FollowersScraper:
+    """粉丝数据抓取器"""
+
+    def __init__(self):
+        self.page: Optional[Page] = None
+        self.exporter = ExcelExporter()
+        self.api_data: List[Dict[str, Any]] = []
+
+    async def scrape_followers_data(
+        self,
+        days: int = Config.DEFAULT_FOLLOWER_DAYS,
+        progress_callback: Optional[Callable[[str, int], None]] = None
+    ) -> str:
+        """
+        抓取粉丝数据
+
+        Args:
+            days: 抓取最近多少天的数据
+            progress_callback: 进度回调函数 callback(message, progress_percent)
+
+        Returns:
+            str: 导出文件的路径
+        """
+
+        def update_progress(msg: str, progress: int = 0):
+            """更新进度"""
+            logger.info(msg)
+            if progress_callback:
+                progress_callback(msg, progress)
+
+        try:
+            update_progress(f"开始抓取最近{days}天的粉丝数据...", 0)
+
+            # 获取页面
+            if not self.page:
+                self.page = await browser_manager.new_page()
+
+            # 清空之前的API数据
+            self.api_data = []
+
+            # 设置API拦截
+            update_progress("正在设置数据拦截...", 10)
+            self._setup_api_interception()
+
+            # 导航到粉丝数据页面
+            update_progress("正在导航到粉丝数据页面...", 20)
+            logger.info("开始导航到粉丝数据页面")
+            try:
+                await self.page.goto(
+                    Config.FOLLOWERS_DATA_URL,
+                    wait_until='domcontentloaded',
+                    timeout=60000  # 增加到60秒
+                )
+                logger.info("页面导航完成，等待数据加载")
+                await asyncio.sleep(3)  # 等待数据加载
+
+                # 选择日期范围
+                logger.info(f"正在选择日期范围：近{days}天")
+                await self._select_date_range(days)
+                await asyncio.sleep(2)  # 等待数据更新
+                logger.info(f"数据加载等待完成，API数据数量: {len(self.api_data)}")
+            except Exception as e:
+                logger.error(f"导航失败: {e}")
+                raise Exception(f"导航到粉丝数据页面失败: {str(e)}")
+
+            # 尝试从API获取数据
+            if self.api_data:
+                update_progress("成功从API获取数据", 50)
+                data = self._process_api_data(days)
+            else:
+                update_progress("API未返回数据，尝试从页面提取...", 50)
+                data = await self._scrape_from_page(days, update_progress)
+
+            # 获取当前粉丝总数（使用最后一天的总粉丝数）
+            update_progress("正在提取粉丝总数...", 70)
+            total_followers = 0
+            if data and len(data) > 0:
+                # 使用最后一天的总粉丝数
+                total_followers = data[-1].get('总粉丝数', 0)
+
+            if total_followers == 0:
+                # 如果从图表中获取失败，尝试从页面其他位置提取
+                total_followers = await self._extract_total_followers()
+
+            # 添加总数信息
+            for item in data:
+                item['当前粉丝总数'] = total_followers
+
+            # 导出为CSV（UTF-8 BOM）
+            update_progress("正在生成CSV文件...", 80)
+
+            filename = Config.get_output_filename('followers_data').replace('.xlsx', '.csv')
+            output_path = self._export_to_csv(data, filename)
+
+            # 验证导出结果
+            update_progress("正在验证导出数据...", 90)
+            validation_result = self._validate_export(output_path, days)
+
+            if validation_result['success']:
+                update_progress(f"✓ 粉丝数据抓取成功！文件保存在: {output_path}", 100)
+                logger.info(f"数据验证通过: {validation_result['message']}")
+                logger.info("SUCCESS")  # 输出SUCCESS标记
+                print("SUCCESS")  # 同时打印到控制台
+            else:
+                logger.warning(f"数据验证警告: {validation_result['message']}")
+
+            return output_path
+
+        except Exception as e:
+            update_progress(f"抓取失败: {str(e)}", 0)
+            logger.error(f"抓取粉丝数据失败: {e}", exc_info=True)
+            raise
+
+    def _setup_api_interception(self):
+        """设置API拦截器"""
+        async def handle_response(response: Response):
+            """处理API响应"""
+            try:
+                # 检查是否是粉丝数据的API
+                url = response.url
+                if any(keyword in url for keyword in ['/fans/trend', '/fans/data', '/api/fans']):
+                    logger.debug(f"拦截到粉丝API: {url}")
+
+                    try:
+                        data = await response.json()
+                        self.api_data.append(data)
+                        logger.info(f"成功获取API数据: {len(data)} 条记录")
+                    except:
+                        logger.warning("API响应不是JSON格式")
+
+            except Exception as e:
+                logger.debug(f"处理API响应时出错: {e}")
+
+        # 注册响应监听器
+        self.page.on('response', lambda response: asyncio.create_task(handle_response(response)))
+
+    async def _select_date_range(self, days: int):
+        """
+        选择日期范围
+
+        Args:
+            days: 天数 (7, 30)
+        """
+        try:
+            # 映射天数到页面文本
+            day_mapping = {
+                7: "近7天",
+                30: "近30天"
+            }
+
+            target_text = day_mapping.get(days, "近30天")
+
+            # 查找并点击对应的日期选项
+            selector = f'label.select-item-default:has-text("{target_text}")'
+
+            logger.info(f"正在查找日期选择器: {selector}")
+
+            try:
+                label = await self.page.wait_for_selector(selector, timeout=5000)
+                if label:
+                    # 检查是否已经是选中状态
+                    class_name = await label.get_attribute('class') or ''
+                    if 'item-active' not in class_name:
+                        logger.info(f"点击日期选项: {target_text}")
+                        await label.click()
+                        logger.info(f"成功选择日期范围: {target_text}")
+                    else:
+                        logger.info(f"日期范围已经是 {target_text}，无需切换")
+                else:
+                    logger.warning(f"未找到日期选择器: {selector}")
+            except Exception as e:
+                logger.warning(f"选择日期范围失败: {e}，继续使用当前日期范围")
+
+        except Exception as e:
+            logger.warning(f"选择日期范围时出错: {e}")
+
+    def _process_api_data(self, days: int) -> List[Dict[str, Any]]:
+        """
+        处理从API获取的数据
+
+        Args:
+            days: 天数
+
+        Returns:
+            处理后的数据列表
+        """
+        processed_data = []
+
+        try:
+            # 这里需要根据实际API返回的数据结构来解析
+            # 假设API返回的数据格式如下：
+            # {
+            #   "data": {
+            #     "list": [
+            #       {"date": "2025-01-08", "new_count": 10, "lost_count": 2},
+            #       ...
+            #     ]
+            #   }
+            # }
+
+            for api_response in self.api_data:
+                if isinstance(api_response, dict):
+                    # 尝试不同的数据路径
+                    list_data = None
+
+                    # 路径1: data.list
+                    if 'data' in api_response and 'list' in api_response['data']:
+                        list_data = api_response['data']['list']
+                    # 路径2: 直接是list
+                    elif 'list' in api_response:
+                        list_data = api_response['list']
+                    # 路径3: 直接是数组
+                    elif isinstance(api_response, list):
+                        list_data = api_response
+
+                    if list_data and isinstance(list_data, list):
+                        for item in list_data[:days]:
+                            processed_data.append({
+                                '日期': item.get('date', ''),
+                                '新增粉丝': item.get('new_count', 0),
+                                '掉丝数': item.get('lost_count', 0),
+                                '净增长': item.get('new_count', 0) - item.get('lost_count', 0)
+                            })
+
+            logger.info(f"从API处理了 {len(processed_data)} 条记录")
+
+        except Exception as e:
+            logger.error(f"处理API数据失败: {e}", exc_info=True)
+
+        return processed_data[:days] if processed_data else []
+
+    async def _scrape_from_page(
+        self,
+        days: int,
+        progress_callback: Callable[[str, int], None]
+    ) -> List[Dict[str, Any]]:
+        """
+        从页面DOM中抓取数据（备选方案）
+
+        Args:
+            days: 天数
+            progress_callback: 进度回调函数
+
+        Returns:
+            抓取的数据列表
+        """
+        scraped_data = []
+
+        try:
+            # 方案1: 尝试从图表中提取数据
+            progress_callback("尝试从图表中提取数据...", 55)
+
+            # 查找图表容器
+            chart_selectors = [
+                '.fans-chart',
+                '.chart-container',
+                '[class*="chart"]',
+                'canvas'
+            ]
+
+            chart_element = None
+            for selector in chart_selectors:
+                try:
+                    chart_element = await self.page.wait_for_selector(selector, timeout=2000)
+                    if chart_element:
+                        logger.info(f"找到图表元素: {selector}")
+                        break
+                except:
+                    continue
+
+            if chart_element:
+                # 模拟鼠标移动触发tooltip
+                scraped_data = await self._extract_from_tooltip(chart_element, days, progress_callback)
+
+            # 方案2: 如果图表提取失败，尝试从表格中提取
+            if not scraped_data:
+                progress_callback("尝试从表格中提取数据...", 60)
+
+                table_selectors = [
+                    'table',
+                    '.data-table',
+                    '[class*="table"]'
+                ]
+
+                for selector in table_selectors:
+                    try:
+                        table = await self.page.wait_for_selector(selector, timeout=2000)
+                        if table:
+                            scraped_data = await self._extract_from_table(table, days)
+                            if scraped_data:
+                                break
+                    except:
+                        continue
+
+            if not scraped_data:
+                logger.warning("未能从页面提取到粉丝数据")
+                progress_callback("未能从页面提取到数据", 0)
+
+        except Exception as e:
+            logger.error(f"从页面抓取数据失败: {e}", exc_info=True)
+
+        return scraped_data
+
+    async def _extract_from_tooltip(
+        self,
+        chart_element,
+        days: int,
+        progress_callback: Callable[[str, int], None]
+    ) -> List[Dict[str, Any]]:
+        """
+        通过切换图表选项并移动鼠标触发tooltip来提取数据
+
+        策略：
+        1. 依次切换到"新增粉丝数"、"流失粉丝数"、"总粉丝数"
+        2. 每种数据类型遍历所有采样点
+        3. 按日期合并所有数据
+
+        Args:
+            chart_element: 图表元素
+            days: 天数
+            progress_callback: 进度回调函数
+
+        Returns:
+            提取的数据列表
+        """
+        import re
+
+        # 使用字典存储数据，以日期为key
+        data_dict = {}
+
+        try:
+            # 获取图表的边界框
+            box = await chart_element.bounding_box()
+            if not box:
+                return []
+
+            # 定义三种数据类型
+            chart_types = [
+                {"name": "新增粉丝数", "field": "新增粉丝"},
+                {"name": "流失粉丝数", "field": "掉丝数"},
+                {"name": "总粉丝数", "field": "总粉丝数"}
+            ]
+
+            for type_idx, chart_type in enumerate(chart_types):
+                logger.info(f"正在提取{chart_type['name']}...")
+                progress_callback(f"正在提取{chart_type['name']}...", 50 + type_idx * 10)
+
+                # 切换到对应的图表选项
+                try:
+                    label_selector = f'label.select-item-default:has-text("{chart_type["name"]}")'
+                    label = await self.page.wait_for_selector(label_selector, timeout=3000)
+
+                    if label:
+                        class_name = await label.get_attribute('class') or ''
+                        if 'item-active' not in class_name:
+                            await label.click()
+                            await asyncio.sleep(1.0)
+                            logger.info(f"已切换到: {chart_type['name']}")
+                except Exception as e:
+                    logger.warning(f"切换图表选项失败 ({chart_type['name']}): {e}")
+                    continue
+
+                # 使用60个采样点
+                sample_points = 60
+
+                for i in range(sample_points):
+                    x = box['x'] + box['width'] - (i * (box['width'] / sample_points))
+                    y = box['y'] + box['height'] / 2
+
+                    await self.page.mouse.move(x, y)
+                    await asyncio.sleep(0.3)
+
+                    try:
+                        tooltip = await self.page.wait_for_selector('[class*="tooltip"]', timeout=500, state='visible')
+                        if tooltip:
+                            tooltip_text = await tooltip.inner_text()
+
+                            lines = tooltip_text.strip().split('\n')
+                            if len(lines) >= 3:
+                                date_str = lines[0].strip()
+                                value_str = lines[2].strip()
+
+                                numbers = re.findall(r'(\d+)', value_str)
+                                value = int(numbers[0]) if numbers else 0
+
+                                if date_str not in data_dict:
+                                    data_dict[date_str] = {
+                                        '日期': date_str,
+                                        '新增粉丝': 0,
+                                        '掉丝数': 0,
+                                        '总粉丝数': 0
+                                    }
+                                    logger.debug(f"新增日期: {date_str}")
+
+                                data_dict[date_str][chart_type['field']] = value
+                                logger.debug(f"{chart_type['name']} - {date_str}: {value}")
+                    except:
+                        continue
+
+            # 将字典转换为列表，并按日期排序（最新的在前）
+            data = list(data_dict.values())
+            data.sort(key=lambda x: x['日期'], reverse=True)
+
+            # 根据天数参数限制数据量
+            if len(data) > days:
+                data = data[:days]
+                logger.info(f"根据天数限制，截取前{days}天数据")
+
+            # 计算净增长
+            for item in data:
+                item['净增长'] = item['新增粉丝'] - item['掉丝数']
+
+            logger.info(f"数据提取完成，共 {len(data)} 天")
+            progress_callback(f"数据提取完成，共 {len(data)} 天", 90)
+
+        except Exception as e:
+            logger.error(f"从tooltip提取数据失败: {e}", exc_info=True)
+
+        return data
+
+    def _parse_tooltip_text(self, text: str, chart_type: str) -> Optional[Dict[str, Any]]:
+        """
+        解析tooltip文本
+
+        Args:
+            text: tooltip文本（格式：日期\n标签\n数值）
+            chart_type: 图表类型（"新增粉丝数"/"流失粉丝数"/"总粉丝数"）
+
+        Returns:
+            解析后的数据字典
+        """
+        try:
+            import re
+            from datetime import datetime
+
+            # 记录原始文本用于调试
+            logger.debug(f"解析tooltip文本 ({chart_type}): {repr(text)}")
+
+            lines = text.strip().split('\n')
+            if len(lines) < 3:
+                logger.warning(f"Tooltip格式不正确（行数少于3）: {repr(text)}")
+                return None
+
+            # 第一行是日期
+            date_str = lines[0].strip()
+
+            # 尝试多种日期格式
+            date_match = re.search(r'(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})', date_str)
+            if date_match:
+                year, month, day = date_match.groups()
+                formatted_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            else:
+                # 如果无法解析日期，使用默认格式
+                formatted_date = date_str
+
+            # 第三行才是数值
+            value_str = lines[2].strip() if len(lines) > 2 else '0'
+
+            # 提取数字
+            numbers = re.findall(r'(\d+)', value_str)
+            if not numbers:
+                logger.warning(f"未能从tooltip中提取数值: {repr(value_str)}")
+                return None
+
+            value = int(numbers[0])
+
+            # 根据图表类型创建结果
+            result = {'日期': formatted_date}
+
+            if chart_type == "新增粉丝数":
+                result['新增粉丝'] = value
+                result['掉丝数'] = 0
+                result['总粉丝数'] = 0
+            elif chart_type == "流失粉丝数":
+                result['新增粉丝'] = 0
+                result['掉丝数'] = value
+                result['总粉丝数'] = 0
+            elif chart_type == "总粉丝数":
+                result['新增粉丝'] = 0
+                result['掉丝数'] = 0
+                result['总粉丝数'] = value
+
+            logger.debug(f"解析结果: {result}")
+            return result
+
+        except Exception as e:
+            logger.error(f"解析tooltip文本失败: {e}, 文本: {repr(text)}")
+            return None
+
+    def _export_to_csv(self, data: List[Dict[str, Any]], filename: str) -> str:
+        """
+        导出数据为CSV文件（UTF-8 BOM）
+
+        Args:
+            data: 要导出的数据列表
+            filename: 文件名
+
+        Returns:
+            导出文件的完整路径
+        """
+        import csv
+        from pathlib import Path
+
+        # 确保输出目录存在
+        output_dir = Path('data/output')
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = output_dir / filename
+
+        # 定义CSV列顺序
+        fieldnames = ['日期', '新增粉丝', '掉丝数', '总粉丝数', '净增长', '当前粉丝总数']
+
+        # 写入CSV文件（UTF-8 BOM）
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+
+        logger.info(f"CSV文件已导出: {output_path}, 共 {len(data)} 条记录")
+        return str(output_path)
+
+    def _validate_export(self, filepath: str, expected_days: int) -> Dict[str, Any]:
+        """
+        验证导出的CSV文件
+
+        Args:
+            filepath: CSV文件路径
+            expected_days: 期望的天数
+
+        Returns:
+            验证结果字典
+        """
+        import csv
+        from pathlib import Path
+
+        result = {
+            'success': True,
+            'message': '',
+            'row_count': 0,
+            'expected_days': expected_days
+        }
+
+        try:
+            if not Path(filepath).exists():
+                result['success'] = False
+                result['message'] = f"文件不存在: {filepath}"
+                return result
+
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                result['row_count'] = len(rows)
+
+                # 验证数据行数
+                if len(rows) < expected_days * 0.8:  # 允许20%的误差
+                    result['success'] = False
+                    result['message'] = f"数据行数不足: 期望{expected_days}行，实际{len(rows)}行"
+                    return result
+
+                # 验证必要字段是否存在
+                for i, row in enumerate(rows[:5]):  # 检查前5行
+                    if not row.get('日期'):
+                        result['success'] = False
+                        result['message'] = f"第{i+1}行缺少日期字段"
+                        return result
+
+                # 验证数据完整性
+                valid_data_count = sum(1 for row in rows if row.get('总粉丝数') and int(row.get('总粉丝数', 0)) > 0)
+                if valid_data_count == 0:
+                    result['success'] = False
+                    result['message'] = "所有数据的总粉丝数都为0，数据可能无效"
+                    return result
+
+                result['message'] = f"验证通过: 共{len(rows)}天数据，{valid_data_count}天有效数据"
+
+        except Exception as e:
+            result['success'] = False
+            result['message'] = f"验证过程出错: {str(e)}"
+
+        return result
+
+    async def _extract_from_table(self, table, days: int) -> List[Dict[str, Any]]:
+        """
+        从表格中提取数据
+
+        Args:
+            table: 表格元素
+            days: 天数
+
+        Returns:
+            提取的数据列表
+        """
+        data = []
+
+        try:
+            # 查找所有行
+            rows = await table.query_selector_all('tr')
+
+            for i, row in enumerate(rows[1:min(days+1, len(rows))]):  # 跳过表头
+                try:
+                    cells = await row.query_selector_all('td')
+                    if len(cells) >= 2:
+                        date_text = await cells[0].inner_text()
+                        count_text = await cells[1].inner_text()
+
+                        # 解析数据
+                        data.append({
+                            '日期': date_text.strip(),
+                            '新增粉丝': int(count_text.strip()) if count_text.strip().isdigit() else 0,
+                            '掉丝数': 0,
+                            '净增长': 0
+                        })
+
+                except Exception as e:
+                    logger.debug(f"解析表格行失败: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"从表格提取数据失败: {e}")
+
+        return data
+
+    async def _extract_total_followers(self) -> int:
+        """
+        提取粉丝总数
+
+        Returns:
+            粉丝总数
+        """
+        try:
+            # 尝试多种可能的选择器
+            selectors = [
+                '.fans-count',
+                '.follower-count',
+                '[class*="fan"] [class*="count"]',
+                '.total-followers',
+                'span:has-text("粉丝")'
+            ]
+
+            for selector in selectors:
+                try:
+                    element = await self.page.wait_for_selector(selector, timeout=2000)
+                    if element:
+                        text = await element.inner_text()
+                        # 提取数字
+                        import re
+                        numbers = re.findall(r'[\d,]+', text)
+                        if numbers:
+                            # 移除逗号并转换为整数
+                            count = int(numbers[0].replace(',', ''))
+                            logger.info(f"粉丝总数: {count}")
+                            return count
+                except:
+                    continue
+
+            logger.warning("未能提取到粉丝总数")
+            return 0
+
+        except Exception as e:
+            logger.error(f"提取粉丝总数失败: {e}")
+            return 0
+
+    async def close(self):
+        """关闭页面"""
+        if self.page:
+            await self.page.close()
+            self.page = None
