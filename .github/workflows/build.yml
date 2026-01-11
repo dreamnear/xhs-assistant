@@ -1,0 +1,154 @@
+name: Build Application
+
+# 触发条件：推送到 master 分支或手动触发
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  # 防止 OOM 错误
+  NODE_OPTIONS: "--max-old-space-size=4096"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    strategy:
+      # 单个平台失败不影响其他平台
+      fail-fast: false
+      matrix:
+        include:
+          # Windows 构建
+          - os: windows-latest
+            name: 'Windows'
+            platform: 'windows/amd64'
+            spec_file: 'build/windows.spec'
+            output_name: '小红书数据抓取工具.exe'
+            artifact_name: 'xhs-assistant-windows.exe'
+
+          # macOS 构建
+          - os: macos-latest
+            name: 'macOS'
+            platform: 'darwin/amd64'
+            spec_file: 'build/build_onefile.spec'
+            output_name: '小红书数据抓取工具'
+            artifact_name: 'xhs-assistant-macos'
+
+          # Linux 构建
+          - os: ubuntu-latest
+            name: 'Linux'
+            platform: 'linux/amd64'
+            spec_file: 'build/build_onefile.spec'
+            output_name: 'xhs-assistant'
+            artifact_name: 'xhs-assistant-linux'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 2. 设置 Python 环境
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. 安装 PyInstaller
+      - name: Install PyInstaller
+        run: |
+          pip install pyinstaller==6.11.0
+
+      # 5. 安装 Playwright 浏览器（可选，构建时不需要，运行时需要）
+      - name: Install Playwright
+        run: |
+          playwright install chromium
+        continue-on-error: true  # 构建环境中安装失败不影响打包
+
+      # 6. 使用 PyInstaller 打包
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller ${{ matrix.spec_file }} --clean
+        shell: bash
+
+      # 7. 查找生成的可执行文件
+      - name: Find executable
+        id: find_exe
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            echo "exe_path=dist/$(ls dist/*.exe | head -n1 | xargs basename)" >> $GITHUB_OUTPUT
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            echo "exe_path=dist/$(ls dist/ | head -n1)" >> $GITHUB_OUTPUT
+          else
+            echo "exe_path=dist/$(ls dist/ | head -n1)" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      # 8. 重命名输出文件
+      - name: Rename executable
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            mv "dist/${{ matrix.output_name }}" "dist/${{ matrix.artifact_name }}" || echo "File not found, skipping rename"
+          else
+            mv "dist/${{ matrix.output_name }}" "dist/${{ matrix.artifact_name }}" || echo "File not found, skipping rename"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      # 9. 上传构建产物
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.artifact_name }}
+            dist/${{ matrix.output_name }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      # 10. 显示构建信息
+      - name: Build summary
+        run: |
+          echo "### 构建完成 ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**平台**: ${{ matrix.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**操作系统**: ${{ runner.os }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Python 版本**: $(python --version)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "构建产物已上传到 Artifacts" >> $GITHUB_STEP_SUMMARY
+        shell: bash
+
+  # 汇总所有构建状态
+  build-summary:
+    name: Build Summary
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check build status
+        run: |
+          echo "### 🎉 构建流程完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "请查看上方各平台的构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "下载构建产物：" >> $GITHUB_STEP_SUMMARY
+          echo "1. 进入本次 Actions 运行页面" >> $GITHUB_STEP_SUMMARY
+          echo "2. 滚动到页面底部的 \"Artifacts\" 区域" >> $GITHUB_STEP_SUMMARY
+          echo "3. 下载对应平台的可执行文件" >> $GITHUB_STEP_SUMMARY
