@@ -30,13 +30,22 @@ jobs:
             asset_name: 'xhs-assistant-windows-v${{ github.ref_name }}.exe'
             asset_content_type: 'application/vnd.microsoft.portable-executable'
 
-          # macOS 构建
-          - os: macos-latest
-            name: 'macOS'
-            platform: 'darwin/amd64'
+          # macOS Intel 构建
+          - os: macos-13
+            name: 'macOS Intel'
+            platform: 'darwin/x86_64'
             spec_file: 'build/build_onefile.spec'
             output_name: '小红书数据抓取工具'
-            asset_name: 'xhs-assistant-macos-v${{ github.ref_name }}'
+            asset_name: 'xhs-assistant-macos-intel-v${{ github.ref_name }}'
+            asset_content_type: 'application/octet-stream'
+
+          # macOS Apple Silicon 构建
+          - os: macos-14
+            name: 'macOS Apple Silicon'
+            platform: 'darwin/arm64'
+            spec_file: 'build/build_onefile.spec'
+            output_name: '小红书数据抓取工具'
+            asset_name: 'xhs-assistant-macos-arm64-v${{ github.ref_name }}'
             asset_content_type: 'application/octet-stream'
 
           # Linux 构建

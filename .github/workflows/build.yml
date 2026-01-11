@@ -32,13 +32,21 @@ jobs:
             output_name: '小红书数据抓取工具.exe'
             artifact_name: 'xhs-assistant-windows.exe'
 
-          # macOS 构建
-          - os: macos-latest
-            name: 'macOS'
-            platform: 'darwin/amd64'
+          # macOS Intel 构建
+          - os: macos-13
+            name: 'macOS Intel'
+            platform: 'darwin/x86_64'
             spec_file: 'build/build_onefile.spec'
             output_name: '小红书数据抓取工具'
-            artifact_name: 'xhs-assistant-macos'
+            artifact_name: 'xhs-assistant-macos-intel'
+
+          # macOS Apple Silicon 构建
+          - os: macos-14
+            name: 'macOS Apple Silicon'
+            platform: 'darwin/arm64'
+            spec_file: 'build/build_onefile.spec'
+            output_name: '小红书数据抓取工具'
+            artifact_name: 'xhs-assistant-macos-arm64'
 
           # Linux 构建
           - os: ubuntu-latest
