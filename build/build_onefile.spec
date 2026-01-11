@@ -7,12 +7,16 @@ PyInstaller简化配置 - 单文件版本
 block_cipher = None
 
 a = Analysis(
-    ['main_v2.py'],
-    pathex=[],
+    ['../main.py'],  # 使用相对于 build/ 目录的路径
+    pathex=['../'],
     binaries=[],
     datas=[
-        ('.env.example', '.'),
-        ('config.py', '.'),
+        ('../.env.example', '.'),
+        ('../config.py', '.'),
+        ('../core', 'core'),
+        ('../modules', 'modules'),
+        ('../gui', 'gui'),
+        ('../utils', 'utils'),
     ],
     hiddenimports=[
         'playwright',

@@ -7,21 +7,21 @@ PyInstaller配置文件 - 小红书数据抓取工具
 block_cipher = None
 
 a = Analysis(
-    ['main_v2.py'],
-    pathex=[],
+    ['../main.py'],  # 使用相对于 build/ 目录的路径
+    pathex=['../'],
     binaries=[],
     datas=[
         # 包含配置文件
-        ('.env.example', '.'),
+        ('../.env.example', '.'),
 
         # 包含config.py
-        ('config.py', '.'),
+        ('../config.py', '.'),
 
         # 包含所有模块
-        ('core', 'core'),
-        ('modules', 'modules'),
-        ('gui', 'gui'),
-        ('utils', 'utils'),
+        ('../core', 'core'),
+        ('../modules', 'modules'),
+        ('../gui', 'gui'),
+        ('../utils', 'utils'),
     ],
     hiddenimports=[
         # Playwright相关
