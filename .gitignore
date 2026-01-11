@@ -80,7 +80,7 @@ browsers/
 .sessions/
 
 # Build artifacts
-build/
+# build/  # 注释掉，需要保留 spec 文件
 dist/
 *.exe
 *.app
